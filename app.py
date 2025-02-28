@@ -5,7 +5,7 @@ import google.generativeai as genai
 import asyncio
 import re
 
-st.title("📊 Salary Content Generator | Built at Grapevine")
+st.title("📊 obanai | Built at Grapevine")
 
 # ----- Define Synonyms for Robust Matching -----
 YOE_SYNONYMS = ["yoe", "years", "experience"]
