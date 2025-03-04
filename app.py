@@ -2,8 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import google.generativeai as genai
+import openai
 import asyncio
 import re
+from sklearn.metrics.pairwise import cosine_similarity
+import time
 
 st.title("📊 obanai | Built at Grapevine")
 
@@ -126,86 +129,77 @@ def select_viral_entries(df):
         selected_rows.append(rep_row)
     return pd.DataFrame(selected_rows)
 
-def parse_query(query_text):
+# ----- OPTIMIZED EMBEDDING FUNCTIONS -----
+
+# Cache for storing computed embeddings
+@st.cache_data(ttl=3600)  # Cache embeddings for 1 hour
+def get_embeddings_batch(texts, api_key):
+    """Get embeddings for multiple texts in a single API call"""
+    client = openai.OpenAI(api_key=api_key)
+    try:
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=texts
+        )
+        return [item.embedding for item in response.data], None
+    except Exception as e:
+        return None, str(e)
+
+@st.cache_data(ttl=3600)
+def prepare_job_descriptions(df_json):
+    """Prepare job descriptions for embedding"""
+    df = pd.read_json(df_json)
+    job_descriptions = []
+    for _, row in df.iterrows():
+        job_desc = f"{row['Job_Title']} with {int(row['YOE'])} YOE"
+        if 'Location' in row and not pd.isna(row['Location']):
+            job_desc += f" in {row['Location']}"
+        job_descriptions.append(job_desc)
+    return job_descriptions
+
+def find_matching_jobs(query, df, embeddings, openai_api_key, top_n=5):
+    """Find matching jobs using cosine similarity with precomputed embeddings"""
+    start_time = time.time()
+    
+    # Get query embedding (single API call)
+    query_embeddings, error = get_embeddings_batch([query], openai_api_key)
+    if error:
+        return None, None, f"Error getting query embedding: {error}"
+    
+    query_embedding = query_embeddings[0]
+    
+    # Calculate similarities
+    query_embedding_np = np.array(query_embedding)
+    job_embeddings_np = np.array(embeddings)
+    
+    similarities = cosine_similarity([query_embedding_np], job_embeddings_np)[0]
+    
+    # Get top matching indices
+    top_indices = np.argsort(similarities)[-top_n:][::-1]
+    
+    processing_time = time.time() - start_time
+    
+    # Return filtered dataframe
+    return df.iloc[top_indices], similarities[top_indices], processing_time
+
+def generate_custom_query_post(filtered_df, query, location=None, count=None):
     """
-    Parses a natural language query.
-    For example, from:
-      'Software Engineer with experience of 5 years and need 2 salaries'
-    it extracts:
-      - roles: ['Software Engineer']
-      - experience: 5
-      - location: None (if not specified)
-      - salary_count: 2 (if specified)
-    """
-    roles = []
-    experience = None
-    location = None
-    salary_count = None
-
-    # Extract experience (e.g., "5 years")
-    exp_match = re.search(r'(\d+)\s*(?:years|yrs)', query_text, re.IGNORECASE)
-    if exp_match:
-        experience = float(exp_match.group(1))
-
-    # Extract salary count (e.g., "need 2 salaries" or "show me 3 salaries")
-    count_match = re.search(r'\b(?:need|show me|give me)\s+(\d+)\s*salaries', query_text, re.IGNORECASE)
-    if count_match:
-        salary_count = int(count_match.group(1))
-
-    # Use "salaries" pattern if present; otherwise split on "with"
-    if "salaries" in query_text.lower():
-        role_match = re.search(r'^(.*?)\s+salaries', query_text, re.IGNORECASE)
-        if role_match:
-            role_str = role_match.group(1).strip()
-            role_str = re.sub(r'^(I want|show me)\s+', '', role_str, flags=re.IGNORECASE).strip()
-            if role_str:
-                roles = [role_str]
-    else:
-        parts = re.split(r'\s+with\s+', query_text, flags=re.IGNORECASE)
-        if parts:
-            role_str = parts[0].strip()
-            role_str = re.sub(r'^(I want|show me)\s+', '', role_str, flags=re.IGNORECASE).strip()
-            if role_str:
-                roles = [role_str]
-
-    # Extract location if provided (e.g., "in Bangalore")
-    location_match = re.search(r'in\s+([A-Za-z ]+)', query_text, re.IGNORECASE)
-    if location_match:
-        location = location_match.group(1).strip()
-
-    return roles, experience, location, salary_count
-
-def generate_custom_query_post(filtered_df, roles, location, count=None):
-    """
-    Generates the custom query post text directly from filtered data.
-    If a count is provided, select that many top entries; otherwise group by company.
+    Generates the custom query post text from embedding-filtered data.
     """
     if count is not None:
-        sorted_df = filtered_df.sort_values("Salary", ascending=False)
-        selected_df = sorted_df.head(count)
-        companies = ", ".join([clean_company_name(comp) for comp in selected_df["Company"].unique()]) if "Company" in selected_df.columns else "Unknown Companies"
-        n = len(selected_df)
-        entries = [format_salary_entry_custom(row) for _, row in selected_df.iterrows()]
+        selected_df = filtered_df.head(count)
     else:
-        if "Company" not in filtered_df.columns:
-            selected_df = filtered_df.head(5)
-            companies = "Unknown Companies"
-        else:
-            sorted_df = filtered_df.sort_values("Salary", ascending=False)
-            selected_df = sorted_df.groupby("Company", as_index=False).first()
-            companies = ", ".join([clean_company_name(comp) for comp in selected_df["Company"].unique()])
-        n = len(selected_df)
-        entries = [format_salary_entry_custom(row) for _, row in selected_df.iterrows()]
+        selected_df = filtered_df.head(5)
+    
+    companies = ", ".join([clean_company_name(comp) for comp in selected_df["Company"].unique()]) if "Company" in selected_df.columns else "Unknown Companies"
+    n = len(selected_df)
+    entries = [format_salary_entry_custom(row) for _, row in selected_df.iterrows()]
 
-    role_str = roles[0] if roles else ""
     header_info = f"in {location}" if location else f"for {companies}"
-    post = (f"{n} {role_str} Salaries {header_info} -\n" +
+    post = (f"{n} Salaries matching '{query}' {header_info} -\n" +
             "\n".join(entries) +
             "\nWe share 5 new salaries from Grapevine every 12 hours.\nHit follow")
     return post
-
-async def analyze_custom_query(api_key, roles, location, filtered_df, count=None):
-    return generate_custom_query_post(filtered_df, roles, location, count), None
 
 async def analyze_salaries(api_key, company_name, cleaned_df):
     # Standard (viral) post generation using Gemini
@@ -230,122 +224,204 @@ Hit follow"""
     except Exception as e:
         return None, str(e)
 
-# ------------------ Standard (Viral Role) Feature ------------------
+# ------------------ Streamlit UI ------------------
 
-gemini_api_key = st.text_input("Enter your Gemini API key", type="password")
-uploaded_files = st.file_uploader("Upload CSV(s)", type="csv", accept_multiple_files=True)
+st.markdown("""
+## About This App
+This app helps you generate engaging social media posts about salary data. It offers two modes:
+- *Standard Post Generation*: Creates viral-style posts using Gemini AI (requires Gemini API key)
+- *Custom Query Feature*: Uses OpenAI embeddings to semantically search for relevant salary data (requires OpenAI API key)
+""")
 
-if uploaded_files and gemini_api_key:
+tab1, tab2 = st.tabs(["Standard Post Generation", "Custom Query"])
+
+with tab1:
     st.header("Standard Post Generation (Viral Role Selection)")
-    if st.button("1M+ Users .. Lessgo!"):
-        all_results = {}
-        for uploaded_file in uploaded_files:
-            try:
-                uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file)
-                default_company_name = uploaded_file.name.split('.')[0]
-                cleaned_df = clean_data(df)
-                with st.spinner(f"Generating post for {default_company_name}..."):
-                    result, error = asyncio.run(analyze_salaries(gemini_api_key, default_company_name, cleaned_df))
-                all_results[default_company_name] = (result, error)
-            except Exception as e:
-                all_results[uploaded_file.name.split('.')[0]] = (None, str(e))
-        for company_name, (result, error) in all_results.items():
-            if error:
-                st.error(f"Error for {company_name}: {error}")
-            else:
-                st.subheader(f"Generated Post for {company_name}")
-                st.code(result)
-                st.download_button(
-                    f"Download Post for {company_name}",
-                    result,
-                    file_name=f"{company_name.lower()}_post.txt"
-                )
-    
-    # Individual File Processing:
-    for uploaded_file in uploaded_files:
-        try:
-            uploaded_file.seek(0)
-            df = pd.read_csv(uploaded_file)
-            default_company_name = uploaded_file.name.split('.')[0]
-            company_name = st.text_input(f"Company Name for {uploaded_file.name}",
-                                         default_company_name,
-                                         key=f"company_name_{uploaded_file.name}")
-            st.write(f"Raw Data Preview for {uploaded_file.name}:")
-            st.dataframe(df.head())
-            column_options = df.columns.tolist()
-            manual_yoe_column = st.selectbox("Select YOE column (optional)",
-                                             options=["None"] + column_options,
-                                             key=f"yoe_select_{uploaded_file.name}")
-            manual_yoe_column = manual_yoe_column if manual_yoe_column != "None" else None
-            cleaned_df = clean_data(df, manual_yoe_column)
-            st.success(f"Cleaned {len(cleaned_df)} rows for {uploaded_file.name}!")
-            if st.button(f"Generate Post for {company_name}", key=f"generate_{uploaded_file.name}"):
-                with st.spinner("Generating..."):
-                    result, error = asyncio.run(analyze_salaries(gemini_api_key, company_name, cleaned_df))
+    gemini_api_key = st.text_input("Enter your Gemini API key", type="password", key="gemini_key")
+    uploaded_files = st.file_uploader("Upload CSV(s)", type="csv", accept_multiple_files=True, key="standard_files")
+
+    if uploaded_files and gemini_api_key:
+        if st.button("1M+ Users .. Lessgo!"):
+            all_results = {}
+            for uploaded_file in uploaded_files:
+                try:
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file)
+                    default_company_name = uploaded_file.name.split('.')[0]
+                    cleaned_df = clean_data(df)
+                    with st.spinner(f"Generating post for {default_company_name}..."):
+                        result, error = asyncio.run(analyze_salaries(gemini_api_key, default_company_name, cleaned_df))
+                    all_results[default_company_name] = (result, error)
+                except Exception as e:
+                    all_results[uploaded_file.name.split('.')[0]] = (None, str(e))
+            for company_name, (result, error) in all_results.items():
                 if error:
-                    st.error(f"Error: {error}")
+                    st.error(f"Error for {company_name}: {error}")
                 else:
                     st.subheader(f"Generated Post for {company_name}")
                     st.code(result)
                     st.download_button(
-                        f"Download Post ({company_name})",
+                        f"Download Post for {company_name}",
                         result,
                         file_name=f"{company_name.lower()}_post.txt"
                     )
-        except Exception as e:
-            st.error(f"Error processing {uploaded_file.name}: {e}")
-elif uploaded_files:
-    st.warning("Please enter your Gemini API key.")
-elif gemini_api_key:
-    st.info("Please upload at least one CSV file.")
-else:
-    st.info("Enter your Gemini API key and upload CSV files to begin.")
-
-# ------------------ Custom Query Feature ------------------
-
-st.markdown("---")
-st.header("Custom Query Feature")
-query_text = st.text_area("Enter your natural language query (e.g., 'Software Engineer with experience of 5 years and need 2 salaries'):")
-
-if query_text and st.button("Run Query"):
-    if uploaded_files:
-        combined_data = []
+        
+        # Individual File Processing:
         for uploaded_file in uploaded_files:
             try:
+                st.markdown("---")
                 uploaded_file.seek(0)
                 df = pd.read_csv(uploaded_file)
                 default_company_name = uploaded_file.name.split('.')[0]
-                # Add company info for custom query filtering/formatting
-                df["Company"] = default_company_name
-                cleaned_df = clean_data(df)
-                combined_data.append(cleaned_df)
+                company_name = st.text_input(f"Company Name for {uploaded_file.name}",
+                                            default_company_name,
+                                            key=f"company_name_{uploaded_file.name}")
+                st.write(f"Raw Data Preview for {uploaded_file.name}:")
+                st.dataframe(df.head())
+                column_options = df.columns.tolist()
+                manual_yoe_column = st.selectbox("Select YOE column (optional)",
+                                                options=["None"] + column_options,
+                                                key=f"yoe_select_{uploaded_file.name}")
+                manual_yoe_column = manual_yoe_column if manual_yoe_column != "None" else None
+                cleaned_df = clean_data(df, manual_yoe_column)
+                st.success(f"Cleaned {len(cleaned_df)} rows for {uploaded_file.name}!")
+                if st.button(f"Generate Post for {company_name}", key=f"generate_{uploaded_file.name}"):
+                    with st.spinner("Generating..."):
+                        result, error = asyncio.run(analyze_salaries(gemini_api_key, company_name, cleaned_df))
+                    if error:
+                        st.error(f"Error: {error}")
+                    else:
+                        st.subheader(f"Generated Post for {company_name}")
+                        st.code(result)
+                        st.download_button(
+                            f"Download Post ({company_name})",
+                            result,
+                            file_name=f"{company_name.lower()}_post.txt"
+                        )
             except Exception as e:
-                st.error(f"Error processing {uploaded_file.name} in custom query: {e}")
-        if combined_data:
-            combined_df = pd.concat(combined_data, ignore_index=True)
-            st.write("Combined Data from all files:", combined_df.head())
-            roles, experience, location, salary_count = parse_query(query_text)
-            if roles:
-                role_mask = combined_df["Job_Title"].apply(lambda x: any(role.lower() in x.lower() for role in roles))
-            else:
-                role_mask = pd.Series([True] * len(combined_df), index=combined_df.index)
-            if experience is not None:
-                exp_mask = combined_df["YOE"].apply(lambda x: abs(x - experience) <= 1)
-            else:
-                exp_mask = pd.Series([True] * len(combined_df), index=combined_df.index)
-            filtered_df = combined_df[role_mask & exp_mask]
-            st.write("Filtered Data after applying query:", filtered_df.head())
-            if filtered_df.empty:
+                st.error(f"Error processing {uploaded_file.name}: {e}")
+
+    elif uploaded_files:
+        st.warning("Please enter your Gemini API key for standard post generation.")
+    elif gemini_api_key:
+        st.info("Please upload at least one CSV file.")
+    else:
+        st.info("Enter your Gemini API key and upload CSV files to begin.")
+
+with tab2:
+    st.header("Custom Query Feature (Using OpenAI Embeddings)")
+    st.markdown("""
+    This feature uses OpenAI's text-embedding-3-small model to semantically match your query with relevant salary data.
+    It understands natural language queries better than traditional filtering.
+    """)
+    
+    openai_api_key = st.text_input("Enter your OpenAI API key (required for semantic search)", type="password", key="openai_key")
+    uploaded_files_custom = st.file_uploader("Upload CSV(s)", type="csv", accept_multiple_files=True, key="custom_files")
+    
+    # Process uploaded files and cache embeddings
+    if uploaded_files_custom and openai_api_key:
+        # Initialize session state for combined data if needed
+        if "combined_df" not in st.session_state:
+            st.session_state.combined_df = None
+            st.session_state.job_embeddings = None
+            st.session_state.job_descriptions = None
+        
+        # Process files if they haven't been processed yet or if files changed
+        file_names = [f.name for f in uploaded_files_custom]
+        if ("processed_files" not in st.session_state or 
+            st.session_state.processed_files != file_names):
+            
+            with st.spinner("Processing uploaded files..."):
+                combined_data = []
+                for uploaded_file in uploaded_files_custom:
+                    try:
+                        uploaded_file.seek(0)
+                        df = pd.read_csv(uploaded_file)
+                        default_company_name = uploaded_file.name.split('.')[0]
+                        df["Company"] = default_company_name
+                        cleaned_df = clean_data(df)
+                        combined_data.append(cleaned_df)
+                    except Exception as e:
+                        st.error(f"Error processing {uploaded_file.name}: {e}")
+                
+                if combined_data:
+                    combined_df = pd.concat(combined_data, ignore_index=True)
+                    st.session_state.combined_df = combined_df
+                    st.session_state.processed_files = file_names
+                    
+                    # Precompute all embeddings at once
+                    with st.spinner("Computing embeddings for all data (one-time operation)..."):
+                        df_json = combined_df.to_json()
+                        job_descriptions = prepare_job_descriptions(df_json)
+                        
+                        # Process in batches of 1000
+                        batch_size = 1000  # OpenAI supports larger batches 
+                        all_embeddings = []
+                        
+                        for i in range(0, len(job_descriptions), batch_size):
+                            batch = job_descriptions[i:i+batch_size]
+                            progress_text = f"Processing batch {i//batch_size + 1}/{(len(job_descriptions)-1)//batch_size + 1}"
+                            with st.spinner(progress_text):
+                                batch_embeddings, error = get_embeddings_batch(batch, openai_api_key)
+                                if error:
+                                    st.error(f"Error: {error}")
+                                    break
+                                all_embeddings.extend(batch_embeddings)
+                        
+                        if len(all_embeddings) == len(job_descriptions):
+                            st.session_state.job_embeddings = all_embeddings
+                            st.session_state.job_descriptions = job_descriptions
+                            st.success(f"Successfully processed {len(combined_df)} entries and computed embeddings!")
+        
+        # Display data summary
+        if st.session_state.combined_df is not None:
+            st.write(f"Data ready: {len(st.session_state.combined_df)} salary entries")
+            with st.expander("View Sample Data"):
+                st.dataframe(st.session_state.combined_df.head())
+    
+    # Query interface
+    query_text = st.text_area("Enter your natural language query (e.g., 'Senior software engineer with machine learning experience'):")
+    count_slider = st.slider("Number of results to show", min_value=1, max_value=10, value=5)
+    
+    if query_text and st.session_state.get("combined_df") is not None and st.session_state.get("job_embeddings") is not None:
+        if st.button("Run Semantic Search"):
+            # Extract location if provided in the query
+            location_match = re.search(r'in\s+([A-Za-z ]+)', query_text, re.IGNORECASE)
+            location = location_match.group(1).strip() if location_match else None
+            
+            with st.spinner("Searching for matching roles..."):
+                filtered_df, similarities, processing_time = find_matching_jobs(
+                    query_text, 
+                    st.session_state.combined_df, 
+                    st.session_state.job_embeddings, 
+                    openai_api_key, 
+                    top_n=count_slider
+                )
+            
+            if filtered_df is None:
+                st.error("Error processing query. Please try again.")
+            elif filtered_df.empty:
                 st.warning("No matching entries found for the query.")
             else:
-                with st.spinner("Generating custom query post..."):
-                    result, error = asyncio.run(analyze_custom_query(gemini_api_key, roles, location, filtered_df, salary_count))
-                if error:
-                    st.error(f"Error: {error}")
-                else:
-                    st.subheader("Custom Query Generated Post")
-                    st.code(result)
-                    st.download_button("Download Custom Query Post", result, file_name="custom_query_post.txt")
-    else:
-        st.warning("Please upload CSV files for the custom query feature.")
+                st.success(f"Found matching entries in {processing_time:.2f} seconds!")
+                
+                # Display similarity scores
+                st.subheader("Matching Results")
+                display_df = filtered_df.copy()
+                display_df['Similarity'] = similarities
+                display_df['Similarity'] = display_df['Similarity'].apply(lambda x: f"{x:.2f}")
+                st.dataframe(display_df[['Company', 'Job_Title', 'YOE', 'Salary', 'Similarity']])
+                
+                # Generate post
+                result = generate_custom_query_post(filtered_df, query_text, location, count_slider)
+                st.subheader("Generated Post")
+                st.code(result)
+                st.download_button(
+                    "Download Custom Query Post", 
+                    result, 
+                    file_name="custom_query_post.txt"
+                )
+    elif not st.session_state.get("combined_df") and uploaded_files_custom:
+        st.warning("Still processing data. Please wait...")
+    elif not uploaded_files_custom:
+        st.info("Please upload CSV files for the custom query feature.")
