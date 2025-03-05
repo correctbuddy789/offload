@@ -17,7 +17,6 @@ EMBEDDING_MODEL_PRICING = {
     "text-embedding-3-large": {"pages_per_dollar": 9615, "tokens_per_page": 800},
     "text-embedding-ada-002": {"pages_per_dollar": 12500, "tokens_per_page": 800}
 }
-# Calculate tokens per dollar for the current model
 tokens_per_dollar = EMBEDDING_MODEL_PRICING[EMBEDDING_MODEL]["pages_per_dollar"] * EMBEDDING_MODEL_PRICING[EMBEDDING_MODEL]["tokens_per_page"]
 
 # ----- Define Synonyms for Robust Matching -----
@@ -103,16 +102,13 @@ def clean_data(df, manual_yoe_column=None):
     df.dropna(subset=['Salary', 'Job_Title'], inplace=True)
     df['YOE'] = pd.to_numeric(df['YOE'], errors='coerce')
     df.dropna(subset=['YOE'], inplace=True)
-    # Round YOE to whole number for display
     df['YOE'] = df['YOE'].round(0)
     return df
 
 def clean_company_name(company):
-    # Remove unwanted substring starting with " - query_result" (case-insensitive)
     return re.sub(r'\s*-\s*query_result.*$', '', company, flags=re.IGNORECASE)
 
 def format_salary_entry(row):
-    # For standard (viral) posts
     job_title = row['Job_Title']
     yoe = row['YOE']
     salary_in_lakhs = row['Salary'] / 100000
@@ -123,7 +119,6 @@ def format_salary_entry(row):
     return f"{job_title} with {int(yoe)} YOE earns {salary_str}"
 
 def format_salary_entry_custom(row):
-    # For custom query posts (includes company info)
     job_title = row['Job_Title']
     job_title = re.sub(r'\s*-\s*query_result.*$', '', job_title, flags=re.IGNORECASE)
     yoe = row['YOE']
@@ -148,7 +143,6 @@ def select_viral_entries(df):
 
 # ----- OPTIMIZED EMBEDDING FUNCTIONS -----
 
-# Cache for storing computed embeddings (now returns token usage too)
 @st.cache_data(ttl=3600)
 def get_embeddings_batch(texts, api_key):
     client = openai.OpenAI(api_key=api_key)
@@ -158,14 +152,14 @@ def get_embeddings_batch(texts, api_key):
             input=texts
         )
         embeddings = [item.embedding for item in response.data]
-        token_usage = response.usage.get("total_tokens", 0) if hasattr(response, 'usage') else 0
+        # Use getattr to safely extract total_tokens from the usage object.
+        token_usage = getattr(response.usage, 'total_tokens', 0) if hasattr(response, 'usage') else 0
         return embeddings, token_usage, None
     except Exception as e:
         return None, 0, str(e)
 
 @st.cache_data(ttl=3600)
 def prepare_job_descriptions(df_json):
-    """Prepare job descriptions for embedding"""
     df = pd.read_json(df_json)
     job_descriptions = []
     for _, row in df.iterrows():
@@ -176,37 +170,26 @@ def prepare_job_descriptions(df_json):
     return job_descriptions
 
 def find_matching_jobs(query, df, embeddings, openai_api_key, top_n=5):
-    """Find matching jobs using cosine similarity with precomputed embeddings"""
     start_time = time.time()
-    
-    # Get query embedding (single API call) and capture token usage
     query_embeddings, query_tokens, error = get_embeddings_batch([query], openai_api_key)
     if error:
         return None, None, None, f"Error getting query embedding: {error}"
-    
     query_embedding = query_embeddings[0]
     query_embedding_np = np.array(query_embedding)
     job_embeddings_np = np.array(embeddings)
-    
     similarities = cosine_similarity([query_embedding_np], job_embeddings_np)[0]
     top_indices = np.argsort(similarities)[-top_n:][::-1]
-    
     processing_time = time.time() - start_time
     return df.iloc[top_indices], similarities[top_indices], processing_time, query_tokens
 
 def generate_custom_query_post(filtered_df, query, location=None, count=None):
-    """
-    Generates the custom query post text from embedding-filtered data.
-    """
     if count is not None:
         selected_df = filtered_df.head(count)
     else:
         selected_df = filtered_df.head(5)
-    
     companies = ", ".join([clean_company_name(comp) for comp in selected_df["Company"].unique()]) if "Company" in selected_df.columns else "Unknown Companies"
     n = len(selected_df)
     entries = [format_salary_entry_custom(row) for _, row in selected_df.iterrows()]
-
     header_info = f"in {location}" if location else f"for {companies}"
     post = (f"{n} Salaries matching '{query}' {header_info} -\n" +
             "\n".join(entries) +
@@ -214,7 +197,6 @@ def generate_custom_query_post(filtered_df, query, location=None, count=None):
     return post
 
 async def analyze_salaries(api_key, company_name, cleaned_df):
-    # Standard (viral) post generation using Gemini
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-2.0-flash-lite')
     viral_df = select_viral_entries(cleaned_df)
@@ -278,7 +260,6 @@ with tab1:
                         file_name=f"{company_name.lower()}_post.txt"
                     )
         
-        # Individual File Processing:
         for uploaded_file in uploaded_files:
             try:
                 st.markdown("---")
@@ -286,14 +267,14 @@ with tab1:
                 df = pd.read_csv(uploaded_file)
                 default_company_name = uploaded_file.name.split('.')[0]
                 company_name = st.text_input(f"Company Name for {uploaded_file.name}",
-                                            default_company_name,
-                                            key=f"company_name_{uploaded_file.name}")
+                                             default_company_name,
+                                             key=f"company_name_{uploaded_file.name}")
                 st.write(f"Raw Data Preview for {uploaded_file.name}:")
                 st.dataframe(df.head())
                 column_options = df.columns.tolist()
                 manual_yoe_column = st.selectbox("Select YOE column (optional)",
-                                                options=["None"] + column_options,
-                                                key=f"yoe_select_{uploaded_file.name}")
+                                                 options=["None"] + column_options,
+                                                 key=f"yoe_select_{uploaded_file.name}")
                 manual_yoe_column = manual_yoe_column if manual_yoe_column != "None" else None
                 cleaned_df = clean_data(df, manual_yoe_column)
                 st.success(f"Cleaned {len(cleaned_df)} rows for {uploaded_file.name}!")
@@ -330,7 +311,6 @@ with tab2:
     openai_api_key = st.text_input("Enter your OpenAI API key (required for semantic search)", type="password", key="openai_key")
     uploaded_files_custom = st.file_uploader("Upload CSV(s)", type="csv", accept_multiple_files=True, key="custom_files")
     
-    # Process uploaded files and cache embeddings
     if uploaded_files_custom and openai_api_key:
         if "combined_df" not in st.session_state:
             st.session_state.combined_df = None
@@ -362,7 +342,6 @@ with tab2:
                     with st.spinner("Computing embeddings for all data (one-time operation)..."):
                         df_json = combined_df.to_json()
                         job_descriptions = prepare_job_descriptions(df_json)
-                        
                         batch_size = 1000
                         all_embeddings = []
                         for i in range(0, len(job_descriptions), batch_size):
@@ -380,7 +359,7 @@ with tab2:
                             st.session_state.job_descriptions = job_descriptions
                             st.success(f"Successfully processed {len(combined_df)} entries and computed embeddings!")
         
-        if st.session_state.combined_df is not None:
+        if st.session_state.get("combined_df") is not None:
             st.write(f"Data ready: {len(st.session_state.combined_df)} salary entries")
             with st.expander("View Sample Data"):
                 st.dataframe(st.session_state.combined_df.head())
@@ -430,10 +409,9 @@ with tab2:
                     result, 
                     file_name="custom_query_post.txt"
                 )
-                # Display token usage and cost information
                 cost = query_tokens / tokens_per_dollar
                 st.info(f"Embedding Query used {query_tokens} tokens, costing approximately ${cost:.8f}")
-    elif not st.session_state.get("combined_df") and uploaded_files_custom:
+    elif st.session_state.get("combined_df") is None and uploaded_files_custom:
         st.warning("Still processing data. Please wait...")
     elif not uploaded_files_custom:
         st.info("Please upload CSV files for the custom query feature.")
