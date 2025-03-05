@@ -349,4 +349,5 @@ Hit follow"""
                     )
                     manual_yoe_column = manual_yoe_column if manual_yoe_column != "None" else None
                     
-                    cleane
+                    cleaned_df = self.clean_data(df, manual_yoe_column)
+                    st.success(f"Cleane
